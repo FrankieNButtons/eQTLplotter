@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use plotters::backend::DrawingBackend;
+use plotters::coord::Shift;
 use plotters::prelude::*;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 use plotters::style::{RGBAColor, RGBColor};
@@ -59,29 +61,43 @@ fn collect_all_phenos(path: &str) -> Result<std::collections::HashSet<String>> {
     loop {
         first_line.clear();
         let bytes = reader.read_line(&mut first_line)?;
-        if bytes == 0 { anyhow::bail!("{} appears empty", path); }
-        if first_line.trim().is_empty() || first_line.starts_with('#') { continue; }
+        if bytes == 0 {
+            anyhow::bail!("{} appears empty", path);
+        }
+        if first_line.trim().is_empty() || first_line.starts_with('#') {
+            continue;
+        }
         let toks: Vec<&str> = first_line.trim_end().split('\t').collect();
-        if detect_p_index_from_header(&toks).is_some() { has_header = true; }
+        if detect_p_index_from_header(&toks).is_some() {
+            has_header = true;
+        }
         break;
     }
 
     let mut set: HashSet<String> = HashSet::new();
     let mut process_line = |line: &str| {
-        if line.is_empty() || line.starts_with('#') { return; }
+        if line.is_empty() || line.starts_with('#') {
+            return;
+        }
         let cols: Vec<&str> = line.split('\t').collect();
         if let Some(pheno) = cols.get(0).map(|s| s.trim()) {
-            if !pheno.is_empty() { set.insert(pheno.to_string()); }
+            if !pheno.is_empty() {
+                set.insert(pheno.to_string());
+            }
         }
     };
 
-    if !has_header { process_line(first_line.trim_end()); }
+    if !has_header {
+        process_line(first_line.trim_end());
+    }
 
     let mut buf = String::new();
     loop {
         buf.clear();
         let n = reader.read_line(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         process_line(buf.trim_end());
     }
     Ok(set)
@@ -220,6 +236,7 @@ pub fn run_pro(
     thresh: f64,
     bin_width_percent: Option<f64>,
     diff: Option<f64>,
+    venn: bool,
 ) -> Result<()> {
     if let Some(n) = threads {
         rayon::ThreadPoolBuilder::new()
@@ -242,6 +259,31 @@ pub fn run_pro(
     let map_a = map_a_res?;
     let map_b = map_b_res?;
 
+    // Compute phenotype-level Venn counts based on significant hits
+    let mut venn_a_only = 0usize;
+    let mut venn_b_only = 0usize;
+    let mut venn_both = 0usize;
+    {
+        use std::collections::HashSet;
+        let keys_a: HashSet<&String> = map_a.keys().collect();
+        let keys_b: HashSet<&String> = map_b.keys().collect();
+        let mut all: HashSet<&String> = keys_a.union(&keys_b).cloned().collect();
+        for k in all.drain() {
+            let a_has = map_a.get(k).copied().unwrap_or(0) > 0;
+            let b_has = map_b.get(k).copied().unwrap_or(0) > 0;
+            match (a_has, b_has) {
+                (true, true) => venn_both += 1,
+                (true, false) => venn_a_only += 1,
+                (false, true) => venn_b_only += 1,
+                (false, false) => {}
+            }
+        }
+    }
+    println!(
+        "[INFO] Venn counts: A-only = {}, Both = {}, B-only = {}",
+        venn_a_only, venn_both, venn_b_only
+    );
+
     // Unthreshed phenotype counts
     let set_a = collect_all_phenos(&path_a)?;
     let set_b = collect_all_phenos(&path_b)?;
@@ -249,7 +291,10 @@ pub fn run_pro(
     let paired_total = set_a.intersection(&set_b).count();
     println!(
         "[INFO] Phenotypes (unthreshed): left={}, right={}, union={}, paired={}",
-        set_a.len(), set_b.len(), union_total, paired_total
+        set_a.len(),
+        set_b.len(),
+        union_total,
+        paired_total
     );
 
     // Build proportions per phenotype among the UNION of phenotypes that have any significant hits
@@ -291,8 +336,12 @@ pub fn run_pro(
 
     for v in proportions {
         let mut idx = (v / bw).floor() as isize; // histogram-style: floor into [i*bw, (i+1)*bw)
-        if idx < 0 { idx = 0; }
-        if idx as usize >= n_bins { idx = (n_bins - 1) as isize; }
+        if idx < 0 {
+            idx = 0;
+        }
+        if idx as usize >= n_bins {
+            idx = (n_bins - 1) as isize;
+        }
         bins[idx as usize] += 1;
     }
 
@@ -324,6 +373,22 @@ pub fn run_pro(
         .axis_desc_style(("sans-serif", 70))
         .label_style(("sans-serif", 70))
         .draw()?;
+
+    // --- Dense red dashed reference line at x = 50% ---
+    {
+        // // Use many short vertical segments to emulate a dense dash pattern
+        // let dash_len = y_max / 60.0; // short dash segments
+        // let gap_len = y_max / 120.0; // small gaps -> dense dashes
+        // let mut y0 = 0.0;
+        // while y0 < y_max {
+        //     let y1 = (y0 + dash_len).min(y_max);
+        //     chart.draw_series(std::iter::once(PathElement::new(
+        //         vec![(50.0, y0), (50.0, y1)],
+        //         ShapeStyle::from(&RED).stroke_width(3),
+        //     )))?;
+        //     y0 += dash_len + gap_len;
+        // }
+    }
 
     // Custom x-axis labels: left-aligned at start, centered at middle, right-aligned at end
     let (xr, yr) = chart.plotting_area().get_pixel_range();
@@ -366,7 +431,9 @@ pub fn run_pro(
     // Draw bars using histogram-style bin edges
     for i in 0..n_bins {
         let count = bins[i] as f64;
-        if count <= 0.0 { continue; }
+        if count <= 0.0 {
+            continue;
+        }
         let x0 = (i as f64) * bw;
         let x1 = ((i + 1) as f64 * bw).min(100.0);
 
@@ -376,7 +443,13 @@ pub fn run_pro(
         let upper = d * 100.0;
         // use bin midpoint for coloring decision
         let center = (x0 + x1) / 2.0;
-        let fill = if center <= lower { left_color } else if center >= upper { right_color } else { mid_gray };
+        let fill = if center <= lower {
+            left_color
+        } else if center >= upper {
+            right_color
+        } else {
+            mid_gray
+        };
 
         chart.draw_series(std::iter::once(Rectangle::new(
             [(x0, 0.0), (x1, count)],
@@ -404,15 +477,14 @@ pub fn run_pro(
     let proportion = (plotted_count as f64) * 100.0 / denominator;
     let stat_text = format!(
         "{} phenotypes plotted({:.1}% of all {})",
-        plotted_count,
-        proportion,
-        paired_total
+        plotted_count, proportion, paired_total
     );
     // place near top-right; adjust x so it doesn't go off-canvas
-    let tr_x = (width as i32).saturating_sub(135 + 960);
+    let tr_x = (width as i32).saturating_sub(135 + 1000);
     root.draw(&Text::new(stat_text, (tr_x, 70), stat_style))?;
 
-    let legend_text_style = ("sans-serif", 70).into_text_style(&root)
+    let legend_text_style = ("sans-serif", 70)
+        .into_text_style(&root)
         .color(&BLACK)
         .pos(Pos::new(HPos::Right, VPos::Center));
     let right_inset = 20; // stick to right edge
@@ -423,14 +495,131 @@ pub fn run_pro(
 
     // Left file legend row (move down to avoid overlap with stats)
     let y1 = 170;
-    root.draw(&Text::new(stem_a.clone(), (text_x, y1), legend_text_style.clone()))?;
-    root.draw(&Rectangle::new([(box_left_x, y1 - box_size/2), (box_left_x + box_size, y1 + box_size/2)], left_color.filled()))?;
+    root.draw(&Text::new(
+        stem_a.clone(),
+        (text_x, y1),
+        legend_text_style.clone(),
+    ))?;
+    root.draw(&Rectangle::new(
+        [
+            (box_left_x, y1 - box_size / 2),
+            (box_left_x + box_size, y1 + box_size / 2),
+        ],
+        left_color.filled(),
+    ))?;
 
     // Right file legend row (move further down)
     let y2 = 220;
-    root.draw(&Text::new(stem_b.clone(), (text_x, y2), legend_text_style.clone()))?;
-    root.draw(&Rectangle::new([(box_left_x, y2 - box_size/2), (box_left_x + box_size, y2 + box_size/2)], right_color.filled()))?;
+    root.draw(&Text::new(
+        stem_b.clone(),
+        (text_x, y2),
+        legend_text_style.clone(),
+    ))?;
+    root.draw(&Rectangle::new(
+        [
+            (box_left_x, y2 - box_size / 2),
+            (box_left_x + box_size, y2 + box_size / 2),
+        ],
+        right_color.filled(),
+    ))?;
 
+    // --- Optional Venn overlay (does not modify bars/axes) ---
+    fn draw_venn_overlay<DB: DrawingBackend>(
+        area: &DrawingArea<DB, Shift>,
+        w: u32,
+        h: u32,
+        left_label: &str,
+        right_label: &str,
+        left_color: RGBAColor,
+        right_color: RGBAColor,
+        a_only: usize,
+        both: usize,
+        b_only: usize,
+    ) -> Result<()>
+    where
+        DB::ErrorType: std::fmt::Debug + 'static,
+    {
+        // place in center, ensure overlap by spacing centers < 2r
+        let r = ((w.min(h) as f64) * 0.14) as i32;
+        let midx = (w as i32) / 2;
+        let cy = (h as i32 * 2) / 5; // ~40% height
+        let spacing = ((r as f64) * 0.9) as i32; // dx = 1.8r < 2r -> guaranteed overlap
+        let cx1 = midx - spacing;
+        let cx2 = midx + spacing;
+
+        // semi-transparent fills with solid outlines
+        let left_fill = left_color.mix(0.30);
+        let right_fill = right_color.mix(0.30);
+        let stroke_left = RGBColor(left_color.0, left_color.1, left_color.2);
+        let stroke_right = RGBColor(right_color.0, right_color.1, right_color.2);
+
+        area.draw(&Circle::new((cx1, cy), r, left_fill.filled()))?;
+        area.draw(&Circle::new((cx1, cy), r, stroke_left.stroke_width(2)))?;
+        area.draw(&Circle::new((cx2, cy), r, right_fill.filled()))?;
+        area.draw(&Circle::new((cx2, cy), r, stroke_right.stroke_width(2)))?;
+        // draw a grey disk inscribed in the intersection lens to visually mark overlap
+        let dx = (cx2 - cx1).abs() as f64;
+        let r_f = r as f64;
+        let r_inscribed = (2.0 * r_f - dx) / 2.0; // guaranteed >= 0 by spacing choice
+        if r_inscribed > 0.0 {
+            let midx_f = ((cx1 + cx2) / 2) as i32;
+            let mid_gray = RGBAColor(120, 120, 120, 0.60);
+            area.draw(&Circle::new(
+                (midx_f, cy),
+                r_inscribed as i32,
+                mid_gray.filled(),
+            ))?;
+        }
+
+        // labels and counts
+        let title_style = ("sans-serif", 24).into_text_style(area).color(&BLACK);
+        let count_style = ("sans-serif", 28).into_text_style(area).color(&BLACK);
+
+        area.draw(&Text::new(
+            left_label.to_string(),
+            (cx1 - r, cy - r - 12),
+            title_style.clone(),
+        ))?;
+        area.draw(&Text::new(
+            right_label.to_string(),
+            (cx2 + r - 120, cy - r - 12),
+            title_style.clone(),
+        ))?;
+
+        area.draw(&Text::new(
+            format!("{}", a_only),
+            (cx1 - r / 2, cy),
+            count_style.clone(),
+        ))?;
+        area.draw(&Text::new(
+            format!("{}", both),
+            ((cx1 + cx2) / 2 - 10, cy),
+            count_style.clone(),
+        ))?;
+        area.draw(&Text::new(
+            format!("{}", b_only),
+            (cx2 + r / 2 - 20, cy),
+            count_style,
+        ))?;
+
+        Ok(())
+    }
+
+    if venn {
+        println!("[INFO] Venn overlay: enabled");
+        draw_venn_overlay(
+            &root,
+            width,
+            height,
+            &stem_a,
+            &stem_b,
+            left_color,
+            right_color,
+            venn_a_only,
+            venn_both,
+            venn_b_only,
+        )?;
+    }
     root.present()?;
     println!(
         "[OK] PRO: wrote {} (phenos with hits: {}, bin width = {}%)",

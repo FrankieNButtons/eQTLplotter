@@ -92,6 +92,14 @@ fn real_main() -> Result<()> {
                         .value_name("FLOAT"),
                 )
                 .arg(
+                    Arg::new("sv")
+                        .help("SV node-length threshold (usize). If > 0, highlight variants whose node sequence (between 2nd and 3rd ':') length ≥ SV; plot them on top and add '(SV)' legend.")
+                        .long("sv")
+                        .required(false)
+                        .value_parser(value_parser!(usize))
+                        .value_name("USIZE"),
+                )
+                .arg(
                     Arg::new("over")
                         .help("Only emit figures that contain at least one point with p ≤ OVER (overlay filter). Different from --thresh, which filters points; --over filters which figures are produced.")
                         .long("over")
@@ -166,6 +174,13 @@ fn real_main() -> Result<()> {
                         .value_parser(value_parser!(u32))
                         .value_name("U32"),
                 )
+                .arg(
+                    Arg::new("box")
+                        .help("Overlay a box plot (median/IQR/whiskers) on each violin")
+                        .long("box")
+                        .required(false)
+                        .action(clap::ArgAction::SetTrue),
+                )
         )
         .subcommand(
             Command::new("pro")
@@ -191,7 +206,7 @@ fn real_main() -> Result<()> {
                         .long("width")
                         .required(false)
                         .value_parser(value_parser!(u32))
-                        .default_value("25600"),
+                        .default_value("2560"),
                 )
                 .arg(
                     Arg::new("height")
@@ -199,7 +214,7 @@ fn real_main() -> Result<()> {
                         .long("height")
                         .required(false)
                         .value_parser(value_parser!(u32))
-                        .default_value("14400"),
+                        .default_value("1440"),
                 )
                 .arg(
                     Arg::new("threads")
@@ -234,6 +249,13 @@ fn real_main() -> Result<()> {
                         .required(false)
                         .value_parser(value_parser!(f64))
                         .value_name("RATIO"),
+                )
+                .arg(
+                    Arg::new("venn")
+                        .help("Show a Venn diagram (phenotype-level) at the center of the plot")
+                        .long("venn")
+                        .required(false)
+                        .action(clap::ArgAction::SetTrue),
                 )
         )
         .subcommand(
@@ -346,6 +368,7 @@ fn real_main() -> Result<()> {
             let threads = sub.get_one::<usize>("threads").copied();
             let roof_opt = sub.get_one::<u32>("roof").copied();
             let thresh_opt = sub.get_one::<f64>("thresh").copied();
+            let sv_opt = sub.get_one::<usize>("sv").copied();
             let over_opt = sub.get_one::<f64>("over").copied();
 
             let no_tag = sub.get_flag("no-tag");
@@ -371,6 +394,9 @@ fn real_main() -> Result<()> {
             }
             if let Some(ov) = over_opt {
                 println!("[INFO] Over  : {}", ov);
+            }
+            if let Some(sv) = sv_opt {
+                println!("[INFO] SV    : {}", sv);
             }
 
             match mode.as_str() {
@@ -403,6 +429,7 @@ fn real_main() -> Result<()> {
                             roof_opt,
                             thresh_opt,
                             no_tag,
+                            sv_opt,
                         )
                     } else {
                         man::run_with_roof(
@@ -414,6 +441,7 @@ fn real_main() -> Result<()> {
                             roof_opt,
                             thresh_opt,
                             no_tag,
+                            sv_opt,
                         )
                     }
                 }
@@ -455,6 +483,7 @@ fn real_main() -> Result<()> {
                         roof_opt,
                         thresh_opt,
                         no_tag,
+                        sv_opt,
                     )
                 }
                 "compare" => {
@@ -495,6 +524,7 @@ fn real_main() -> Result<()> {
                         thresh_opt,
                         over_opt,
                         no_tag,
+                        sv_opt,
                     )
                 }
                 other => {
@@ -516,6 +546,7 @@ fn real_main() -> Result<()> {
                 .expect("default provided by clap");
             let threads = sub.get_one::<usize>("threads").copied();
             let roof_opt = sub.get_one::<u32>("roof").copied();
+            let with_box = sub.get_flag("box");
 
             let output_path: PathBuf = if let Some(out) = sub.get_one::<String>("output") {
                 PathBuf::from(out)
@@ -533,9 +564,20 @@ fn real_main() -> Result<()> {
             if let Some(roof) = roof_opt {
                 println!("[INFO] Roof  : {}", roof);
             }
+            if with_box {
+                println!("[INFO] Box   : enabled");
+            }
             println!("[INFO] Output: {}", output_str);
 
-            vio::run_vio_multi(&multi_csv, &output_str, width, height, threads, roof_opt)
+            vio::run_vio_multi(
+                &multi_csv,
+                &output_str,
+                width,
+                height,
+                threads,
+                roof_opt,
+                with_box,
+            )
         }
         Some(("qq", sub)) => {
             let multi_csv: String = sub
@@ -609,6 +651,7 @@ fn real_main() -> Result<()> {
                 .expect("default provided by clap");
             let binw = *sub.get_one::<f64>("bin").expect("default provided by clap");
             let diff = sub.get_one::<f64>("diff").copied();
+            let venn = sub.get_flag("venn");
 
             let output_path: PathBuf = if let Some(out) = sub.get_one::<String>("output") {
                 PathBuf::from(out)
@@ -628,6 +671,9 @@ fn real_main() -> Result<()> {
             if let Some(d) = diff {
                 println!("[INFO] Diff  : {}", d);
             }
+            if venn {
+                println!("[INFO] Venn  : enabled");
+            }
             println!("[INFO] Output: {}", output_str);
 
             pro::run_pro(
@@ -639,6 +685,7 @@ fn real_main() -> Result<()> {
                 thresh,
                 Some(binw),
                 diff,
+                venn,
             )
         }
         _ => {

@@ -353,8 +353,12 @@ pub fn run_qq(
     // Optional: cap values at `roof`
     if let Some(r) = roof {
         for p in &mut points {
-            if p.0 > r { p.0 = r; }
-            if p.1 > r { p.1 = r; }
+            if p.0 > r {
+                p.0 = r;
+            }
+            if p.1 > r {
+                p.1 = r;
+            }
         }
     }
 
@@ -447,12 +451,23 @@ pub fn run_qq(
         let under: Vec<(f64, f64)> = points.iter().cloned().filter(|(x, y)| y <= x).collect();
         let over: Vec<(f64, f64)> = points.iter().cloned().filter(|(x, y)| y > x).collect();
 
-        chart.draw_series(under.iter().map(|(x, y)| Circle::new((*x, *y), 3, c_under.filled())))?;
-        chart.draw_series(over.iter().map(|(x, y)| Circle::new((*x, *y), 3, c_over.filled())))?;
+        chart.draw_series(
+            under
+                .iter()
+                .map(|(x, y)| Circle::new((*x, *y), 3, c_under.filled())),
+        )?;
+        chart.draw_series(
+            over.iter()
+                .map(|(x, y)| Circle::new((*x, *y), 3, c_over.filled())),
+        )?;
     } else {
         let base = pastel_palette(3)[0];
         let fill = RGBAColor(base.0, base.1, base.2, 0.65);
-        chart.draw_series(points.iter().map(|(x, y)| Circle::new((*x, *y), 3, fill.filled())))?;
+        chart.draw_series(
+            points
+                .iter()
+                .map(|(x, y)| Circle::new((*x, *y), 3, fill.filled())),
+        )?;
     }
 
     // Draw a thin red dashed diagonal y = x using short segments (Plotters doesn't expose a direct dashed line builder here)

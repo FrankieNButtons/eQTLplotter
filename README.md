@@ -74,8 +74,10 @@ Options:
 - `--thresh <FLOAT>`: significance cutoff for counting variants (default
   `5e-8`).
 - `--bin <PERCENT>`: bin width for the histogram of percentages.
-- `--diff <RATIO>`: color tails for values below `(1-RATIO)*100%` or above
-  `RATIO*100%`.
+- `--diff <RATIO>`: color tails for values below `(1-RATIO)*100%` or above`RATIO*100%`.
+- `--output <FILE>`: output file name (default `out.png`).
+- `--venn`: plot a Venn diagram in the middle of the Histogram.(Not Fully Implemented)
+
 
 ### QQ plot (`qq`)
 
@@ -93,6 +95,7 @@ Options:
 - `--qcut <PERCENT>`: drop top percentage of points by max(−log10 *p*).
 - `--diff`: color points above vs. below the diagonal differently.
 - `--roof <FLOAT>`: cap −log10 *p* before plotting.
+- `--output <PNG>`: output path; defaults to a `qq_*.png` next to the first
 
 ## Examples
 

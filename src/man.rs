@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use plotters::chart::SeriesLabelPosition;
 use plotters::prelude::*;
+use plotters::style::text_anchor::{HPos, Pos, VPos};
+use plotters::style::{FontStyle, RGBColor};
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use plotters::style::text_anchor::{HPos, Pos, VPos};
-use plotters::style::{FontStyle, RGBColor};
 
 /// Compare multiple QTL files by group (e.g., gene), plotting OVERLAY per group:
 /// points from different files are drawn on the same axes, with color encoding the file index.
@@ -22,6 +22,7 @@ pub fn run_compare_overlay(
     thresh_p: Option<f64>,
     over_p: Option<f64>,
     no_tag: bool,
+    sv_thresh: Option<usize>,
 ) -> Result<()> {
     if let Some(n) = threads {
         rayon::ThreadPoolBuilder::new()
@@ -48,15 +49,19 @@ pub fn run_compare_overlay(
     let over_cut = over_p
         .filter(|ov| ov.is_finite() && *ov > 0.0)
         .map(|ov| -ov.log10());
+    let sv_active = sv_thresh.unwrap_or(0) > 0;
+    let sv_cut = sv_thresh.unwrap_or(0);
 
     // Load: for each file -> HashMap<group, Vec<(chr_num, bp, y)>>, applying point-level thresh if provided
     let mut per_file: Vec<HashMap<String, Vec<(u32, u32, f64)>>> = Vec::with_capacity(paths.len());
+    let mut per_file_sv: Vec<HashMap<String, Vec<(u32, u32, f64)>>> = Vec::with_capacity(paths.len());
     for (i, path) in paths.iter().enumerate() {
         println!("[INFO] [File {}/{}] Loading {}", i + 1, paths.len(), path);
         let file =
             File::open(path).with_context(|| format!("Failed to open QTL file: {}", path))?;
         let reader = BufReader::new(file);
         let mut group_map: HashMap<String, Vec<(u32, u32, f64)>> = HashMap::new();
+        let mut sv_group_map: HashMap<String, Vec<(u32, u32, f64)>> = HashMap::new();
         for line in reader.lines().filter_map(|l| l.ok()) {
             if line.starts_with('#') {
                 continue;
@@ -70,15 +75,19 @@ pub fn run_compare_overlay(
             let pseudo = format!("{}\t{}", &group, rest_joined);
             if let Some((chr_num, bp, y)) = parse_line(&pseudo, &re_variant, eps) {
                 if let Some(cut) = y_cut {
-                    if y < cut {
-                        continue;
-                    }
+                    if y < cut { continue; }
                 }
-                group_map.entry(group).or_default().push((chr_num, bp, y));
+                let is_sv = sv_active && is_sv_from_line(&pseudo, sv_cut);
+                if is_sv {
+                    sv_group_map.entry(group.clone()).or_default().push((chr_num, bp, y));
+                } else {
+                    group_map.entry(group.clone()).or_default().push((chr_num, bp, y));
+                }
             }
         }
         println!("[INFO] File {}: {} groups loaded.", path, group_map.len());
         per_file.push(group_map);
+        per_file_sv.push(sv_group_map);
     }
 
     // Gather all groups
@@ -97,10 +106,17 @@ pub fn run_compare_overlay(
 
     let mut n_written = 0usize;
     'group_loop: for group in &all_groups {
-        // Merge keys across files for this group
+        // Merge keys across files for this group (include normal and SV to ensure mapping exists)
         let mut key_set: BTreeSet<(u32, u32)> = BTreeSet::new();
         for gmap in &per_file {
             if let Some(v) = gmap.get(group) {
+                for &(c, b, _) in v {
+                    key_set.insert((c, b));
+                }
+            }
+        }
+        for gmap_sv in &per_file_sv {
+            if let Some(v) = gmap_sv.get(group) {
                 for &(c, b, _) in v {
                     key_set.insert((c, b));
                 }
@@ -164,48 +180,49 @@ pub fn run_compare_overlay(
             }
         }
 
-        // Build per-file point vectors mapped to x coordinate
+        // Build per-file point vectors mapped to x coordinate, including SVs
         let mut per_file_points: Vec<Vec<Point>> = Vec::with_capacity(n_files);
+        let mut per_file_sv_points: Vec<Vec<Point>> = Vec::with_capacity(n_files);
         let mut global_chr_bounds: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
         let mut max_y_all = 0.0f64;
         for (fi, gmap) in per_file.iter().enumerate() {
             let mut v: Vec<Point> = Vec::new();
+            let mut v_sv: Vec<Point> = Vec::new();
             if let Some(raw) = gmap.get(group) {
                 for &(c, b, y) in raw {
-                    let x = *key2x.get(&(c, b)).unwrap();
-                    if y.is_finite() && y > max_y_all {
-                        max_y_all = y;
-                    }
-                    v.push(Point {
-                        chr_num: c,
-                        _bp: b,
-                        ind: x,
-                        y,
-                    });
-                    // track global chr boundaries by x (only meaningful when multiple chromosomes)
-                    if !single_chr {
-                        global_chr_bounds
-                            .entry(c)
-                            .and_modify(|e| {
-                                if x > e.1 {
-                                    e.1 = x;
-                                }
-                                if x < e.0 {
-                                    e.0 = x;
-                                }
-                            })
-                            .or_insert((x, x));
+                    if let Some(&x) = key2x.get(&(c, b)) {
+                        if y.is_finite() && y > max_y_all { max_y_all = y; }
+                        v.push(Point { chr_num: c, _bp: b, ind: x, y });
+                        if !single_chr {
+                            global_chr_bounds.entry(c).and_modify(|e| { if x > e.1 { e.1 = x; } if x < e.0 { e.0 = x; } }).or_insert((x, x));
+                        }
+                    } else {
+                        // Key missing from merged set; skip to avoid panic
+                        // (This can occur if filters differ across files.)
+                        continue;
                     }
                 }
             }
-            // Sort by x for nicer rendering order
+            if let Some(raw_sv) = per_file_sv[fi].get(group) {
+                for &(c, b, y) in raw_sv {
+                    if let Some(&x) = key2x.get(&(c, b)) {
+                        v_sv.push(Point { chr_num: c, _bp: b, ind: x, y });
+                    } else {
+                        // Key missing from merged set; skip gracefully
+                        continue;
+                    }
+                }
+            }
             v.sort_unstable_by_key(|p| p.ind);
+            v_sv.sort_unstable_by_key(|p| p.ind);
             per_file_points.push(v);
+            per_file_sv_points.push(v_sv);
             println!(
-                "[INFO] Group '{}' file {}: {} points",
+                "[INFO] Group '{}' file {}: {} points ({} SV)",
                 group,
                 fi + 1,
-                per_file_points[fi].len()
+                per_file_points[fi].len(),
+                per_file_sv_points[fi].len()
             );
         }
 
@@ -293,6 +310,22 @@ pub fn run_compare_overlay(
                 )
                 .legend(move |(x, y)| Circle::new((x, y), 5, color.filled()));
         }
+        // Overlay SV points and legends per file
+        let sv_color = RGBColor(255, 0, 255);
+        for (fi, pts_sv) in per_file_sv_points.iter().enumerate() {
+            if !pts_sv.is_empty() {
+                chart
+                    .draw_series(pts_sv.iter().map(|p| Circle::new((p.ind, p.y.min(y_max as f64)), 1, sv_color.filled())))?
+                    .label(
+                        std::path::Path::new(&paths[fi])
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string() + "(SV)"
+                    )
+                    .legend(move |(x, y)| Circle::new((x, y), 5, sv_color.filled()));
+            }
+        }
 
         // GW line already drawn above as dashed, thin, and lowest layer.
 
@@ -366,12 +399,33 @@ fn sanitize_file_name(s: &str) -> String {
 
 // const REPORT_EVERY: usize = 100_000;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Point {
     chr_num: u32,
     _bp: u32,
     ind: u32,
     y: f64, // -log10(p)
+}
+// Extract the length of the segment between the 2nd and 3rd ':' in a variant string.
+fn sv_len_from_variant(variant: &str) -> Option<usize> {
+    let mut it = variant.split(':');
+    let _ = it.next()?; // chr
+    let _ = it.next()?; // pos
+    let seg = it.next()?; // node seq between 2nd and 3rd ':'
+    Some(seg.len())
+}
+
+// Determine if a line represents an SV (segment length >= sv_thresh).
+fn is_sv_from_line(line: &str, sv_thresh: usize) -> bool {
+    if sv_thresh == 0 { return false; }
+    let mut it = line.split('\t');
+    let _gene = it.next();
+    if let Some(variant) = it.next() {
+        if let Some(len) = sv_len_from_variant(variant.trim()) {
+            return len >= sv_thresh;
+        }
+    }
+    false
 }
 
 // #[derive(Debug)]
@@ -380,8 +434,6 @@ struct Point {
 //     ind: u32,
 //     y: f64,
 // }
-
-
 
 /// Generate a soft, pastel-like palette of size `n`
 fn pastel_palette(n: usize) -> Vec<RGBColor> {
@@ -536,6 +588,7 @@ pub fn run_with_roof(
     roof: Option<u32>,
     thresh_p: Option<f64>,
     no_tag: bool,
+    sv_thresh: Option<usize>,
 ) -> Result<()> {
     if let Some(n) = threads {
         rayon::ThreadPoolBuilder::new()
@@ -560,49 +613,60 @@ pub fn run_with_roof(
         .filter(|l| !l.starts_with('#')) // ignore commented headers
         .collect();
 
-    // Parallel parse & compute -log10(p)
+    let sv_active = sv_thresh.unwrap_or(0) > 0;
+    let sv_cut = sv_thresh.unwrap_or(0);
+
+    // Parallel parse & compute -log10(p) and SV flag
     let eps = f64::MIN_POSITIVE; // similar to np.finfo(float).tiny
-    let mut points: Vec<(u32, u32, f64)> = lines
+    let mut raw: Vec<(u32, u32, f64, bool)> = lines
         .par_iter()
-        .filter_map(|line| parse_line(line, &re_variant, eps))
+        .filter_map(|line| {
+            let sv = if sv_active { is_sv_from_line(line, sv_cut) } else { false };
+            parse_line(line, &re_variant, eps).map(|(c, b, y)| (c, b, y, sv))
+        })
         .collect();
 
     // Optional p-value threshold filter (p ≤ thresh_p  <=>  y = -log10(p) ≥ -log10(thresh_p))
     if let Some(tp) = thresh_p {
         if tp > 0.0 && tp.is_finite() {
             let y_cut = -tp.log10();
-            points.retain(|&(_, _, y)| y >= y_cut);
+            raw.retain(|&(_, _, y, _)| y >= y_cut);
         }
     }
 
-    if points.is_empty() {
+    if raw.is_empty() {
         anyhow::bail!(
             "No valid rows parsed after applying threshold filter. Check the input format or relax --thresh."
         );
     }
 
     // Parallel sort by (chr_num, bp)
-    points.par_sort_unstable_by(|a, b| match a.0.cmp(&b.0) {
+    raw.par_sort_unstable_by(|a, b| match a.0.cmp(&b.0) {
         std::cmp::Ordering::Equal => a.1.cmp(&b.1),
         other => other,
     });
-
-    let total_points = points.len();
+    let total_points = raw.len();
     // Dynamic report frequency: 1/100 of total (at least 1)
     let report_every: usize = (total_points / 100).max(1);
     // Assign running index "ind" (genomic position across chromosomes)
     let mut max_y = 0.0_f64;
-    let mut out = Vec::with_capacity(points.len());
-    for (i, (chr_num, _bp, y)) in points.into_iter().enumerate() {
+    let mut out: Vec<Point> = Vec::with_capacity(total_points);
+    let mut sv_out: Vec<Point> = Vec::new();
+    for (i, (chr_num, _bp, y, is_sv)) in raw.into_iter().enumerate() {
         if y.is_finite() && y > max_y {
             max_y = y;
         }
-        out.push(Point {
+        let pt = Point {
             chr_num,
             _bp,
             ind: i as u32,
             y,
-        });
+        };
+        if is_sv {
+            sv_out.push(pt.clone());
+        } else {
+            out.push(pt);
+        }
         if i % report_every == 0 && i > 0 {
             let pct = (i as f64 * 100.0 / total_points as f64).round() as u32;
             println!(
@@ -612,7 +676,7 @@ pub fn run_with_roof(
         }
     }
 
-    println!("[INFO] Total points parsed: {}", out.len());
+    println!("[INFO] Total points parsed: {}", out.len() + sv_out.len());
     let show_chr_borders: bool = true; // toggle chromosome borders & labels
 
     // ==== Plot with Plotters ====
@@ -701,13 +765,28 @@ pub fn run_with_roof(
             Circle::new((p.ind, p.y.min(y_max as f64)), 1, palette[idx].filled())
         }))?;
         drawn += chunk.len();
-        let pct = (drawn as f64 * 100.0 / out.len() as f64).round() as u32;
+        let pct = (drawn as f64 * 100.0 / (out.len() + sv_out.len()) as f64).round() as u32;
         println!(
             "[INFO] [Panel 1/1 ({}%)] plotted {:>3}/{:>3} points",
             pct,
             drawn,
-            out.len()
+            out.len() + sv_out.len()
         );
+    }
+
+    // Draw SV points on top if present
+    let sv_color = RGBColor(255, 0, 255);
+    if !sv_out.is_empty() {
+        chart
+            .draw_series(sv_out.iter().map(|p| Circle::new((p.ind, p.y.min(y_max as f64)), 1, sv_color.filled())))?
+            .label(
+                std::path::Path::new(qtl_path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string() + "(SV)"
+            )
+            .legend(move |(x, y)| Circle::new((x, y), 5, sv_color.filled()));
     }
 
     // GW line already drawn above as dashed, thin, and lowest layer.
@@ -782,6 +861,7 @@ pub fn run_multi(
     roof: Option<u32>,
     thresh_p: Option<f64>,
     no_tag: bool,
+    sv_thresh: Option<usize>,
 ) -> Result<()> {
     if let Some(n) = threads {
         rayon::ThreadPoolBuilder::new()
@@ -827,21 +907,26 @@ pub fn run_multi(
             .filter(|l| !l.starts_with('#'))
             .collect();
 
+        let sv_active = sv_thresh.unwrap_or(0) > 0;
+        let sv_cut = sv_thresh.unwrap_or(0);
         let eps = f64::MIN_POSITIVE;
-        let mut points: Vec<(u32, u32, f64)> = lines
+        let mut raw: Vec<(u32, u32, f64, bool)> = lines
             .par_iter()
-            .filter_map(|line| parse_line(line, &re_variant, eps))
+            .filter_map(|line| {
+                let sv = if sv_active { is_sv_from_line(line, sv_cut) } else { false };
+                parse_line(line, &re_variant, eps).map(|(c, b, y)| (c, b, y, sv))
+            })
             .collect();
 
         // Optional p-value threshold filter
         if let Some(tp) = thresh_p {
             if tp > 0.0 && tp.is_finite() {
                 let y_cut = -tp.log10();
-                points.retain(|&(_, _, y)| y >= y_cut);
+                raw.retain(|&(_, _, y, _)| y >= y_cut);
             }
         }
 
-        if points.is_empty() {
+        if raw.is_empty() {
             anyhow::bail!(
                 "No valid rows parsed for panel {} ({}) after threshold filter. Check the input format or relax --thresh.",
                 panel_idx + 1,
@@ -849,27 +934,33 @@ pub fn run_multi(
             );
         }
 
-        let total_points = points.len();
+        let total_points = raw.len();
         // Dynamic report frequency: 1/100 of total (at least 1)
         let report_every: usize = (total_points / 100).max(1);
 
-        points.par_sort_unstable_by(|a, b| match a.0.cmp(&b.0) {
+        raw.par_sort_unstable_by(|a, b| match a.0.cmp(&b.0) {
             std::cmp::Ordering::Equal => a.1.cmp(&b.1),
             other => other,
         });
 
-        let mut out = Vec::with_capacity(points.len());
+        let mut out: Vec<Point> = Vec::with_capacity(total_points);
+        let mut sv_out: Vec<Point> = Vec::new();
         let mut max_y = 0.0_f64;
-        for (i, (chr_num, _bp, y)) in points.into_iter().enumerate() {
+        for (i, (chr_num, _bp, y, is_sv)) in raw.into_iter().enumerate() {
             if y.is_finite() && y > max_y {
                 max_y = y;
             }
-            out.push(Point {
+            let pt = Point {
                 chr_num,
                 _bp,
                 ind: i as u32,
                 y,
-            });
+            };
+            if is_sv {
+                sv_out.push(pt.clone());
+            } else {
+                out.push(pt);
+            }
             if i % report_every == 0 && i > 0 {
                 let pct = (i as f64 * 100.0 / total_points as f64).round() as u32;
                 println!(
@@ -959,15 +1050,30 @@ pub fn run_multi(
                 Circle::new((p.ind, p.y.min(y_max as f64)), 1, palette[idx].filled())
             }))?;
             drawn += chunk.len();
-            let pct = (drawn as f64 * 100.0 / out.len() as f64).round() as u32;
+            let pct = (drawn as f64 * 100.0 / (out.len() + sv_out.len()) as f64).round() as u32;
             println!(
                 "[INFO] [Panel {}/{} ({}%)] plotted {:>3}/{:>3} points",
                 panel_idx + 1,
                 n_panels,
                 pct,
                 drawn,
-                out.len()
+                out.len() + sv_out.len()
             );
+        }
+
+        // Draw SV points on top if present
+        let sv_color = RGBColor(255, 0, 255);
+        if !sv_out.is_empty() {
+            chart
+                .draw_series(sv_out.iter().map(|p| Circle::new((p.ind, p.y.min(y_max as f64)), 1, sv_color.filled())))?
+                .label(
+                    std::path::Path::new(qpath)
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string() + "(SV)"
+                )
+                .legend(move |(x, y)| Circle::new((x, y), 5, sv_color.filled()));
         }
 
         // GW line already drawn above as dashed, thin, and lowest layer.
@@ -1051,6 +1157,7 @@ pub fn run_intersection(
     roof: Option<u32>,
     thresh_p: Option<f64>,
     no_tag: bool,
+    sv_thresh: Option<usize>,
 ) -> Result<()> {
     if let Some(n) = threads {
         rayon::ThreadPoolBuilder::new()
@@ -1094,27 +1201,24 @@ pub fn run_intersection(
     }
 
     // For each file, build HashMap<(chr_num, bp), max y>
+    let sv_active = sv_thresh.unwrap_or(0) > 0;
+    let sv_cut = sv_thresh.unwrap_or(0);
     let mut maps: Vec<HashMap<(u32, u32), f64>> = Vec::with_capacity(paths.len());
+    let mut sv_sets: Vec<BTreeSet<(u32, u32)>> = Vec::with_capacity(paths.len());
     for (i, path) in paths.iter().enumerate() {
         println!("[INFO] [File {}/{}] Loading {}", i + 1, paths.len(), path);
         let file =
             File::open(path).with_context(|| format!("Failed to open QTL file: {}", path))?;
         let reader = BufReader::new(file);
         let mut map: HashMap<(u32, u32), f64> = HashMap::new();
+        let mut sv_set: BTreeSet<(u32, u32)> = BTreeSet::new();
         for line in reader.lines().filter_map(|l| l.ok()) {
-            if line.starts_with('#') {
-                continue;
-            }
-            if let Some((chr_num, bp, y)) = parse_intersection_line(&line, &re_variant, eps, y_cut)
-            {
+            if line.starts_with('#') { continue; }
+            let is_sv = sv_active && is_sv_from_line(&line, sv_cut);
+            if let Some((chr_num, bp, y)) = parse_intersection_line(&line, &re_variant, eps, y_cut) {
                 let key = (chr_num, bp);
-                map.entry(key)
-                    .and_modify(|val| {
-                        if y > *val {
-                            *val = y;
-                        }
-                    })
-                    .or_insert(y);
+                map.entry(key).and_modify(|val| { if y > *val { *val = y; } }).or_insert(y);
+                if is_sv { sv_set.insert(key); }
             }
         }
         if map.is_empty() {
@@ -1130,6 +1234,7 @@ pub fn run_intersection(
             thresh
         );
         maps.push(map);
+        sv_sets.push(sv_set);
     }
 
     // Compute intersection of keys across all maps
@@ -1149,6 +1254,15 @@ pub fn run_intersection(
         intersect_keys.len(),
         maps.len()
     );
+    // Compute union of SV keys within the intersection
+    let mut sv_keys_any: BTreeSet<(u32, u32)> = BTreeSet::new();
+    if sv_active {
+        for s in &sv_sets {
+            for k in s {
+                if intersect_keys.contains(k) { sv_keys_any.insert(*k); }
+            }
+        }
+    }
 
     // For each key, take the maximum y across all maps
     let mut keys_sorted: Vec<(u32, u32)> = intersect_keys.iter().cloned().collect();
@@ -1241,6 +1355,18 @@ pub fn run_intersection(
             out.len()
         );
     }
+    // Overlay SV points and add a legend if any
+    if !sv_keys_any.is_empty() {
+        let sv_color = RGBColor(255, 0, 255);
+        chart
+            .draw_series(
+                out.iter()
+                    .filter(|p| sv_keys_any.contains(&(p.chr_num, p._bp)))
+                    .map(|p| Circle::new((p.ind, p.y.min(y_max as f64)), 3, sv_color.filled()))
+            )?
+            .label("SV")
+            .legend(move |(x, y)| Circle::new((x, y), 5, sv_color.filled()));
+    }
 
     // GW line already drawn above as dashed, thin, and lowest layer.
 
@@ -1296,6 +1422,8 @@ pub fn run_intersection(
     println!("[OK] Wrote {}", output_path);
     Ok(())
 }
+
+
 
 // /// Compare multiple QTL files by group (e.g., gene), plotting one stacked image per group.
 // pub fn run_compare_grouped(

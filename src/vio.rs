@@ -129,6 +129,42 @@ fn kde_density(counts: &[u32], y_max: u32) -> Vec<f64> {
     dens
 }
 
+/// Compute box-plot stats (lower whisker, Q1, median, Q3, upper whisker)
+/// using a simple nearest-rank approach for quartiles and Tukey's 1.5*IQR fences.
+fn box_stats(counts: &[u32]) -> Option<(u32, u32, u32, u32, u32)> {
+    if counts.is_empty() {
+        return None;
+    }
+    let mut v = counts.to_vec();
+    v.sort_unstable();
+    let n = v.len();
+    let idx = |p: f64| -> usize {
+        let r = p * (n as f64 - 1.0);
+        r.round().clamp(0.0, n as f64 - 1.0) as usize
+    };
+    let q1 = v[idx(0.25)];
+    let med = v[idx(0.50)];
+    let q3 = v[idx(0.75)];
+    let iqr = q3.saturating_sub(q1);
+    let fence_lo = q1.saturating_sub((iqr as f64 * 1.5).round() as u32);
+    let fence_hi = q3.saturating_add((iqr as f64 * 1.5).round() as u32);
+    let mut lower = q1;
+    for &val in &v {
+        if val >= fence_lo {
+            lower = val;
+            break;
+        }
+    }
+    let mut upper = q3;
+    for &val in v.iter().rev() {
+        if val <= fence_hi {
+            upper = val;
+            break;
+        }
+    }
+    Some((lower, q1, med, q3, upper))
+}
+
 /// Draw a symmetric KDE-based "violin" at x = `x_center`.
 /// - `density[y]` is the KDE density at y (normalized to max 1).
 /// - The half-width per y is: half_max * density[y].
@@ -169,6 +205,25 @@ where
         border,
         outline.stroke_width(1),
     )))?;
+
+    // central spine from first to last y where density>0
+    let mut y_min_spine: Option<u32> = None;
+    let mut y_max_spine: Option<u32> = None;
+    for (y, &d) in density.iter().enumerate() {
+        if d > 0.0 {
+            // treat >0 as in-region
+            let yu = y as u32;
+            y_min_spine.get_or_insert(yu);
+            y_max_spine = Some(yu);
+        }
+    }
+    if let (Some(y0), Some(y1)) = (y_min_spine, y_max_spine) {
+        chart.draw_series(std::iter::once(PathElement::new(
+            vec![(x_center, y0), (x_center, y1)],
+            BLACK.stroke_width(2),
+        )))?;
+    }
+
     Ok(())
 }
 
@@ -183,6 +238,7 @@ pub fn run_vio_multi(
     height: u32,
     threads: Option<usize>,
     y_roof: Option<u32>,
+    with_box: bool,
 ) -> Result<()> {
     if let Some(n) = threads {
         rayon::ThreadPoolBuilder::new()
@@ -276,6 +332,50 @@ pub fn run_vio_multi(
         let fill = RGBAColor(base.0, base.1, base.2, 0.35);
         let outline = RGBColor(base.0 / 2, base.1 / 2, base.2 / 2);
         draw_violin(&mut chart, x_center, dens, half_max, fill, outline)?;
+
+        if with_box {
+            if let Some((lower, q1, med, q3, upper)) = box_stats(&per_file_counts[idx]) {
+                let box_half = 0.12f64; // narrower than violin
+                let cap_half = 0.06f64; // whisker caps width
+
+                // IQR box: white fill + black frame
+                chart.draw_series(std::iter::once(Rectangle::new(
+                    [(x_center - box_half, q1), (x_center + box_half, q3)],
+                    WHITE.filled(),
+                )))?;
+                chart.draw_series(std::iter::once(Rectangle::new(
+                    [(x_center - box_half, q1), (x_center + box_half, q3)],
+                    BLACK.stroke_width(2),
+                )))?;
+
+                // Median line (horizontal)
+                chart.draw_series(std::iter::once(PathElement::new(
+                    vec![(x_center - box_half, med), (x_center + box_half, med)],
+                    BLACK.stroke_width(2),
+                )))?;
+
+                // Whiskers
+                let box_style = BLACK.stroke_width(2);
+                chart.draw_series(std::iter::once(PathElement::new(
+                    vec![(x_center, lower), (x_center, q1)],
+                    box_style.clone(),
+                )))?;
+                chart.draw_series(std::iter::once(PathElement::new(
+                    vec![(x_center, q3), (x_center, upper)],
+                    box_style.clone(),
+                )))?;
+
+                // Whisker caps
+                chart.draw_series(std::iter::once(PathElement::new(
+                    vec![(x_center - cap_half, lower), (x_center + cap_half, lower)],
+                    box_style.clone(),
+                )))?;
+                chart.draw_series(std::iter::once(PathElement::new(
+                    vec![(x_center - cap_half, upper), (x_center + cap_half, upper)],
+                    box_style,
+                )))?;
+            }
+        }
     }
 
     // Add a simple legend-like labels near the bottom (optional)
